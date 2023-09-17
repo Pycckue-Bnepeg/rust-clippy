@@ -85,6 +85,7 @@ mod bool_to_int_with_if;
 mod booleans;
 mod borrow_deref_ref;
 mod box_default;
+mod camel_case_json;
 mod cargo;
 mod casts;
 mod checked_conversions;
@@ -1123,6 +1124,7 @@ pub fn register_plugins(store: &mut rustc_lint::LintStore, sess: &Session, conf:
     });
     store.register_late_pass(move |_| Box::new(manual_hash_one::ManualHashOne::new(msrv())));
     store.register_late_pass(|_| Box::new(iter_without_into_iter::IterWithoutIntoIter));
+    store.register_late_pass(|_| Box::new(camel_case_json::CamelCaseJson));
     // add lints here, do not remove this comment, it's used in `new_lint`
 }
 
