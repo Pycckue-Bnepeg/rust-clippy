@@ -82,6 +82,7 @@ mod bool_to_int_with_if;
 mod booleans;
 mod borrow_deref_ref;
 mod box_default;
+mod camel_case_json;
 mod cargo;
 mod casts;
 mod checked_conversions;
@@ -99,6 +100,7 @@ mod default_constructed_unit_structs;
 mod default_instead_of_iter_empty;
 mod default_numeric_fallback;
 mod default_union_representation;
+mod define_messages;
 mod dereference;
 mod derivable_impls;
 mod derive;
@@ -1078,6 +1080,8 @@ pub fn register_lints(store: &mut rustc_lint::LintStore, conf: &'static Conf) {
     store.register_late_pass(|_| Box::new(repeat_vec_with_capacity::RepeatVecWithCapacity));
     store.register_late_pass(|_| Box::new(uninhabited_references::UninhabitedReferences));
     store.register_late_pass(|_| Box::new(ineffective_open_options::IneffectiveOpenOptions));
+    store.register_late_pass(|_| Box::new(camel_case_json::CamelCaseJson::default()));
+    store.register_late_pass(|_| Box::new(define_messages::DefineMessages::default()));
     // add lints here, do not remove this comment, it's used in `new_lint`
 }
 
