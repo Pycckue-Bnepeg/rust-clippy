@@ -103,6 +103,7 @@ mod default_constructed_unit_structs;
 mod default_instead_of_iter_empty;
 mod default_numeric_fallback;
 mod default_union_representation;
+mod define_messages;
 mod dereference;
 mod derivable_impls;
 mod derive;
@@ -1125,6 +1126,7 @@ pub fn register_plugins(store: &mut rustc_lint::LintStore, sess: &Session, conf:
     store.register_late_pass(move |_| Box::new(manual_hash_one::ManualHashOne::new(msrv())));
     store.register_late_pass(|_| Box::new(iter_without_into_iter::IterWithoutIntoIter));
     store.register_late_pass(|_| Box::new(camel_case_json::CamelCaseJson));
+    store.register_late_pass(|_| Box::new(define_messages::DefineMessages::default()));
     // add lints here, do not remove this comment, it's used in `new_lint`
 }
 

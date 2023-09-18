@@ -28,6 +28,9 @@ declare_lint_pass!(CamelCaseJson => [CAMEL_CASE_JSON]);
 
 impl<'tcx> LateLintPass<'tcx> for CamelCaseJson {
     fn check_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx Item<'tcx>) {
+        // TODO: поиск трейта в check_crate
+        // TODO: так же реализовать для enum, возможно, что вместо impl IMail триггериться на JsonSchema +
+        // Serialize
         static PATH: &[&str] = &["mails", "mail", "IMail"];
 
         if let ItemKind::Struct(_, _) = item.kind {
