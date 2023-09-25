@@ -1,4 +1,5 @@
-use clippy_utils::get_trait_def_id;
+// TODO: как бы не забыть разработчикам добавить провайдер в `define_module`
+use clippy_utils::{def_path_def_ids, get_trait_def_id};
 use rustc_hir::def::DefKind;
 use rustc_hir::*;
 use rustc_lint::{LateContext, LateLintPass};
@@ -36,7 +37,9 @@ enum Handler {
 pub struct DefineMessages {
     handlers: rustc_data_structures::fx::FxHashMap<def_id::DefId, Handler>,
     routable: Option<def_id::DefId>,
+    messenger: Vec<def_id::DefId>,
     impls: rustc_data_structures::fx::FxHashMap<def_id::DefId, Span>,
+    part_of_provider: Option<def_id::DefId>,
 }
 
 impl_lint_pass!(DefineMessages => [DEFINE_MESSAGES]);
@@ -54,6 +57,15 @@ impl<'tcx> LateLintPass<'tcx> for DefineMessages {
 
         static TSK: &[&str] = &["module_framework", "handlers", "message_handler", "ITaskHandler"];
         static ROUTABLE: &[&str] = &["module_framework", "module", "RoutableModule"];
+        static MESSENGER: &[&str] = &[
+            "module_framework",
+            "module_messenger",
+            "messenger",
+            "Messenger",
+            "publish",
+        ];
+
+        static PROVIDER: &[&str] = &["module_framework", "provider", "PartOfProvider"];
 
         if let Some(req) = get_trait_def_id(cx, REQ) {
             self.handlers.insert(req, Handler::Request);
@@ -72,6 +84,8 @@ impl<'tcx> LateLintPass<'tcx> for DefineMessages {
         }
 
         self.routable = get_trait_def_id(cx, ROUTABLE);
+        self.messenger = def_path_def_ids(cx, MESSENGER).collect();
+        self.part_of_provider = get_trait_def_id(cx, PROVIDER);
     }
 
     fn check_crate_post(&mut self, cx: &LateContext<'tcx>) {
@@ -95,7 +109,7 @@ impl<'tcx> LateLintPass<'tcx> for DefineMessages {
                     for item in items.iter() {
                         if_chain! {
                             if let AssocItemKind::Fn { has_self: false } = item.kind;
-                            if item.ident.name == sym!(router);
+                            if item.ident.name == sym!(router) || item.ident.name == sym!(schema);
                             if let ImplItemKind::Fn(_, body) = cx.tcx.hir().impl_item(item.id).kind;
                             if let value = cx.tcx.hir().body(body).value;
                             if let ExprKind::Block(Block { stmts, .. }, _) = value.kind;
@@ -165,6 +179,33 @@ impl<'tcx> LateLintPass<'tcx> for DefineMessages {
                             GenericArg::Const(_) => {}
                             GenericArg::Infer(_) => {}
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx rustc_hir::Expr<'tcx>) {
+        if_chain! {
+            if let rustc_hir::ExprKind::MethodCall(path, _, [message, ..], span) = &expr.kind;
+            if path.ident.name == sym!(publish);
+            if let Some(did) = cx.typeck_results().type_dependent_def_id(expr.hir_id);
+            if self.messenger.contains(&did);
+            if let ty = cx.typeck_results().expr_ty(message);
+            if let Some(msg_did) = ty.ty_adt_def().map(|adt| adt.did());
+            then {
+                // есть два возможных варианта:
+                // - сообщение, так скажем, одинокое, то просто записываем его
+                // - сообщение является частью провайдера, то тут уже следует проверить именно провайдер
+                if_chain! {
+                    if let Some(pop) = &self.part_of_provider;
+                    if clippy_utils::ty::implements_trait(cx, ty, *pop, &[]);
+                    if let Some(provider) = cx.get_associated_type(ty, *pop, "Provider");
+                    if let Some(p_did) = provider.ty_adt_def().map(|adt| adt.did());
+                    then {
+                        self.impls.insert(p_did, *span);
+                    } else {
+                        self.impls.insert(msg_did, *span);
                     }
                 }
             }

@@ -1,10 +1,10 @@
-// TODO: Config camelCase, define_module all messages, update current code
+// TODO: Config camelCase
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::get_trait_def_id;
 use rustc_errors::Applicability;
 use rustc_hir::*;
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::{declare_lint_pass, declare_tool_lint};
+use rustc_session::{declare_tool_lint, impl_lint_pass};
 
 declare_clippy_lint! {
     /// ### What it does
@@ -24,19 +24,29 @@ declare_clippy_lint! {
     correctness,
     "default lint description"
 }
-declare_lint_pass!(CamelCaseJson => [CAMEL_CASE_JSON]);
+
+#[derive(Default)]
+pub struct CamelCaseJson {
+    json_schema: Option<def_id::DefId>,
+}
+
+impl_lint_pass!(CamelCaseJson => [CAMEL_CASE_JSON]);
 
 impl<'tcx> LateLintPass<'tcx> for CamelCaseJson {
-    fn check_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx Item<'tcx>) {
-        // TODO: поиск трейта в check_crate
-        // TODO: так же реализовать для enum, возможно, что вместо impl IMail триггериться на JsonSchema +
-        // Serialize
-        static PATH: &[&str] = &["mails", "mail", "IMail"];
+    fn check_crate(&mut self, cx: &LateContext<'tcx>) {
+        static PATH: &[&str] = &["schemars", "JsonSchema"];
 
-        if let ItemKind::Struct(_, _) = item.kind {
-            if let Some(mails_did) = get_trait_def_id(cx, PATH) {
+        self.json_schema = get_trait_def_id(cx, PATH);
+    }
+
+    fn check_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx Item<'tcx>) {
+        let is_struct_or_enum = matches!(item.kind, ItemKind::Struct(_, _) | ItemKind::Enum(_, _));
+
+        if is_struct_or_enum {
+            if let Some(json_schema_did) = &self.json_schema {
                 let ty = cx.tcx.type_of(item.owner_id).instantiate_identity();
-                if clippy_utils::ty::implements_trait(cx, ty, mails_did, &[]) {
+
+                if clippy_utils::ty::implements_trait(cx, ty, *json_schema_did, &[]) {
                     if !has_serde_rename_attr(cx, item.hir_id()) {
                         span_lint_and_then(
                             cx,
@@ -46,7 +56,7 @@ impl<'tcx> LateLintPass<'tcx> for CamelCaseJson {
                             |diag| {
                                 diag.span_suggestion(
                                     item.span.shrink_to_lo(),
-                                    "добавьте аттрибут serde",
+                                    "добавьте атрибут serde",
                                     "#[serde(rename_all = \"camelCase\")]\n".to_string(),
                                     Applicability::MachineApplicable,
                                 );
