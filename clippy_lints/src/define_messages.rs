@@ -1,5 +1,6 @@
 // TODO: как бы не забыть разработчикам добавить провайдер в `define_module`
 use clippy_utils::{def_path_def_ids, get_trait_def_id};
+use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def::DefKind;
 use rustc_hir::*;
 use rustc_lint::{LateContext, LateLintPass};
@@ -33,19 +34,117 @@ enum Handler {
     Task,
 }
 
+#[derive(Debug, Clone)]
+enum MessageUsage {
+    Notify(def_id::DefId, Span),
+    Handle(HandleKind),
+}
+
+impl MessageUsage {
+    // /// сообщение, что использовано
+    // fn def_id(&self) -> def_id::DefId {
+    //     match self {
+    //         Self::Notify(did, _) => *did,
+    //         Self::Handle(kind) => kind.def_id(),
+    //     }
+    // }
+
+    /// локация использования
+    fn span(&self) -> Span {
+        match self {
+            Self::Notify(_, span) => *span,
+            Self::Handle(kind) => kind.span(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum HandleKind {
+    Provider(def_id::DefId, Span),
+    Handler(def_id::DefId, Span),
+}
+
+impl HandleKind {
+    fn def_id(&self) -> def_id::DefId {
+        match self {
+            Self::Handler(did, _) => *did,
+            Self::Provider(did, _) => *did,
+        }
+    }
+
+    fn span(&self) -> Span {
+        match self {
+            Self::Handler(_, span) => *span,
+            Self::Provider(_, span) => *span,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct DefineMessages {
-    handlers: rustc_data_structures::fx::FxHashMap<def_id::DefId, Handler>,
+    handlers: FxHashMap<def_id::DefId, Handler>,
     routable: Option<def_id::DefId>,
     messenger: Vec<def_id::DefId>,
-    impls: rustc_data_structures::fx::FxHashMap<def_id::DefId, Span>,
+    impls: FxHashMap<def_id::DefId, MessageUsage>,
     part_of_provider: Option<def_id::DefId>,
+    available_providers: FxHashMap<def_id::DefId, def_id::DefId>, // parent module -> provider struct
 }
 
 impl_lint_pass!(DefineMessages => [DEFINE_MESSAGES]);
 
+impl DefineMessages {
+    #[inline]
+    fn provider_impl(&self, cx: &LateContext<'_>, t: &TraitRef<'_>) -> Option<def_id::DefId> {
+        if_chain! {
+            if let Some(did) = t.path.res.opt_def_id();
+            if let Some(p_did) = cx.tcx.opt_parent(did);
+            if let DefKind::Mod = cx.tcx.def_kind(p_did);
+            if let Some(did) = self.available_providers.get(&p_did);
+            then {
+                return Some(*did);
+            }
+        }
+
+        None
+    }
+
+    #[inline]
+    fn impl_kind(&self, cx: &LateContext<'_>, trait_ref: &TraitRef<'_>) -> Option<HandleKind> {
+        let did = trait_ref.trait_def_id()?;
+
+        if self.handlers.contains_key(&did) {
+            let args = trait_ref.path.segments.first().map(|segment| segment.args());
+
+            if let Some(args) = args {
+                for arg in args.args {
+                    match arg {
+                        GenericArg::Type(ref ty) => {
+                            if_chain! {
+                                if let TyKind::Path(QPath::Resolved(_, path)) = ty.kind;
+                                if let Some(did) = path.res.opt_def_id();
+                                then {
+                                    return Some(HandleKind::Handler(did, trait_ref.path.span));
+                                }
+                            }
+
+                            break;
+                        },
+
+                        _ => {},
+                    }
+                }
+            }
+        } else if let Some(pdid) = self.provider_impl(cx, trait_ref) {
+            return Some(HandleKind::Provider(pdid, trait_ref.path.span));
+        }
+
+        None
+    }
+}
+
 impl<'tcx> LateLintPass<'tcx> for DefineMessages {
     fn check_crate(&mut self, cx: &LateContext<'tcx>) {
+        // TODO: не проверять каждый item, а просто получить все сущности, что имплементируют трейты ниже
         static REQ: &[&str] = &["module_framework", "handlers", "message_handler", "IRequestHandler"];
         static MSG: &[&str] = &["module_framework", "handlers", "message_handler", "IMessageHandler"];
         static NTY: &[&str] = &[
@@ -66,6 +165,7 @@ impl<'tcx> LateLintPass<'tcx> for DefineMessages {
         ];
 
         static PROVIDER: &[&str] = &["module_framework", "provider", "PartOfProvider"];
+        static PDESC: &[&str] = &["module_framework", "provider", "ProviderDesc"];
 
         if let Some(req) = get_trait_def_id(cx, REQ) {
             self.handlers.insert(req, Handler::Request);
@@ -86,6 +186,23 @@ impl<'tcx> LateLintPass<'tcx> for DefineMessages {
         self.routable = get_trait_def_id(cx, ROUTABLE);
         self.messenger = def_path_def_ids(cx, MESSENGER).collect();
         self.part_of_provider = get_trait_def_id(cx, PROVIDER);
+
+        // поиск всех доступных провайдеров и запись их в нашу коллекцию
+        if let Some(did) = get_trait_def_id(cx, PDESC) {
+            self.available_providers = cx
+                .tcx
+                .all_impls(did)
+                .filter_map(|i| {
+                    let prov = cx
+                        .tcx
+                        .impl_trait_ref(i)
+                        .and_then(|v| v.instantiate_identity().self_ty().ty_adt_def().map(|adt| adt.did()))?;
+
+                    let parent = cx.tcx.opt_parent(i)?;
+                    Some((parent, prov))
+                })
+                .collect();
+        }
     }
 
     fn check_crate_post(&mut self, cx: &LateContext<'tcx>) {
@@ -140,47 +257,31 @@ impl<'tcx> LateLintPass<'tcx> for DefineMessages {
             }
         }
 
-        for (_did, span) in &self.impls {
-            clippy_utils::diagnostics::span_lint(
-                cx,
-                DEFINE_MESSAGES,
-                span.clone(),
-                "обработчик сообщения был имплементирован, но не указан в макросе определения модуля `define_module!`",
-            );
+        for (_did, usage) in &self.impls {
+            let help = match usage {
+                MessageUsage::Notify(_, _) => "нотификация была источена, но не объявлена в `define_module!`",
+
+                MessageUsage::Handle(HandleKind::Provider(_, _)) => {
+                    "провайдер был имплементирован, но не указан в `define_module!`"
+                },
+
+                MessageUsage::Handle(HandleKind::Handler(_, _)) => {
+                    "обработчик сообщения был имплементирован, но не указан в `define_module!`"
+                },
+            };
+
+            clippy_utils::diagnostics::span_lint(cx, DEFINE_MESSAGES, usage.span(), help);
         }
     }
 
-    fn check_item(&mut self, _: &LateContext<'tcx>, item: &'tcx Item<'tcx>) {
+    fn check_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx Item<'tcx>) {
         if_chain! {
             if let ItemKind::Impl(imp) = item.kind;
             if let Some(of_trait) = imp.of_trait;
-            if let Some(did) = of_trait.trait_def_id();
-            if self.handlers.contains_key(&did);
+            if let Some(kind) = self.impl_kind(cx, &of_trait);
             then {
-                let args = of_trait.path.segments.first()
-                    .map(|segment| segment.args());
-
-                if let Some(args) = args {
-                    for arg in args.args {
-                        match arg {
-                            GenericArg::Lifetime(_) => {}
-                            GenericArg::Type(ref ty) => {
-                                if_chain! {
-                                    if let TyKind::Path(QPath::Resolved(_, path)) = ty.kind;
-                                    if let Some(did) = path.res.opt_def_id();
-                                    then {
-                                        self.impls.insert(did, of_trait.path.span);
-                                    }
-                                }
-
-                                break;
-                            }
-
-                            GenericArg::Const(_) => {}
-                            GenericArg::Infer(_) => {}
-                        }
-                    }
-                }
+                let did = kind.def_id();
+                self.impls.insert(did, MessageUsage::Handle(kind));
             }
         }
     }
@@ -203,9 +304,9 @@ impl<'tcx> LateLintPass<'tcx> for DefineMessages {
                     if let Some(provider) = cx.get_associated_type(ty, *pop, "Provider");
                     if let Some(p_did) = provider.ty_adt_def().map(|adt| adt.did());
                     then {
-                        self.impls.insert(p_did, *span);
+                        self.impls.insert(p_did, MessageUsage::Notify(p_did, *span));
                     } else {
-                        self.impls.insert(msg_did, *span);
+                        self.impls.insert(msg_did, MessageUsage::Notify(msg_did, *span));
                     }
                 }
             }
