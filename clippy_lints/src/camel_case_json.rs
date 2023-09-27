@@ -1,6 +1,7 @@
 // TODO: Config camelCase
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::get_trait_def_id;
+use clippy_utils::sugg::DiagnosticExt;
 use rustc_errors::Applicability;
 use rustc_hir::*;
 use rustc_lint::{LateContext, LateLintPass};
@@ -54,10 +55,11 @@ impl<'tcx> LateLintPass<'tcx> for CamelCaseJson {
                             item.span,
                             "сообщения для общения с внешним миром (через брокер сообщений) должны быть в camelCase",
                             |diag| {
-                                diag.span_suggestion(
-                                    item.span.shrink_to_lo(),
+                                diag.suggest_item_with_attr(
+                                    cx,
+                                    item.span,
                                     "добавьте атрибут serde",
-                                    "#[serde(rename_all = \"camelCase\")]\n".to_string(),
+                                    "#[serde(rename_all = \"camelCase\")]",
                                     Applicability::MachineApplicable,
                                 );
                             },

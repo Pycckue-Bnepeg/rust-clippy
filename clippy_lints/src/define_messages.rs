@@ -1,9 +1,10 @@
-// TODO: как бы не забыть разработчикам добавить провайдер в `define_module`
+use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::{def_path_def_ids, get_trait_def_id};
 use rustc_data_structures::fx::FxHashMap;
+use rustc_errors::Applicability;
 use rustc_hir::def::DefKind;
 use rustc_hir::*;
-use rustc_lint::{LateContext, LateLintPass};
+use rustc_lint::{LateContext, LateLintPass, LintContext};
 use rustc_session::{declare_tool_lint, impl_lint_pass};
 use rustc_span::Span;
 
@@ -26,7 +27,7 @@ declare_clippy_lint! {
     "default lint description"
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum Handler {
     Request,
     Message,
@@ -34,8 +35,32 @@ enum Handler {
     Task,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Hash, Eq)]
+enum MacroPlace {
+    Providers,
+    Messages,
+    Notifications,
+    Tasks,
+    Requests,
+    EmitsNotifications,
+}
+
+impl MacroPlace {
+    fn to_macro_ident(self) -> &'static str {
+        match self {
+            Self::Providers => "providers",
+            Self::Messages => "messages",
+            Self::Notifications => "notifications",
+            Self::Tasks => "tasks",
+            Self::Requests => "requests",
+            Self::EmitsNotifications => "emits_notifications",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum MessageUsage {
+    // emits_notifications
     Notify(def_id::DefId, Span),
     Handle(HandleKind),
 }
@@ -61,20 +86,20 @@ impl MessageUsage {
 #[derive(Debug, Clone)]
 enum HandleKind {
     Provider(def_id::DefId, Span),
-    Handler(def_id::DefId, Span),
+    Handler(def_id::DefId, Span, Handler),
 }
 
 impl HandleKind {
     fn def_id(&self) -> def_id::DefId {
         match self {
-            Self::Handler(did, _) => *did,
+            Self::Handler(did, _, _) => *did,
             Self::Provider(did, _) => *did,
         }
     }
 
     fn span(&self) -> Span {
         match self {
-            Self::Handler(_, span) => *span,
+            Self::Handler(_, span, _) => *span,
             Self::Provider(_, span) => *span,
         }
     }
@@ -88,6 +113,8 @@ pub struct DefineMessages {
     impls: FxHashMap<def_id::DefId, MessageUsage>,
     part_of_provider: Option<def_id::DefId>,
     available_providers: FxHashMap<def_id::DefId, def_id::DefId>, // parent module -> provider struct
+    macro_places: FxHashMap<MacroPlace, Span>,
+    root_macro_call: Option<Span>,
 }
 
 impl_lint_pass!(DefineMessages => [DEFINE_MESSAGES]);
@@ -112,7 +139,7 @@ impl DefineMessages {
     fn impl_kind(&self, cx: &LateContext<'_>, trait_ref: &TraitRef<'_>) -> Option<HandleKind> {
         let did = trait_ref.trait_def_id()?;
 
-        if self.handlers.contains_key(&did) {
+        if let Some(kind) = self.handlers.get(&did) {
             let args = trait_ref.path.segments.first().map(|segment| segment.args());
 
             if let Some(args) = args {
@@ -123,7 +150,7 @@ impl DefineMessages {
                                 if let TyKind::Path(QPath::Resolved(_, path)) = ty.kind;
                                 if let Some(did) = path.res.opt_def_id();
                                 then {
-                                    return Some(HandleKind::Handler(did, trait_ref.path.span));
+                                    return Some(HandleKind::Handler(did, trait_ref.path.span, *kind));
                                 }
                             }
 
@@ -136,6 +163,25 @@ impl DefineMessages {
             }
         } else if let Some(pdid) = self.provider_impl(cx, trait_ref) {
             return Some(HandleKind::Provider(pdid, trait_ref.path.span));
+        }
+
+        None
+    }
+
+    #[inline]
+    fn suggest_span(&self, cx: &LateContext<'_>, place: MacroPlace) -> Option<(Span, bool)> {
+        if let Some(span) = self.macro_places.get(&place) {
+            if let Some(root) = &self.root_macro_call {
+                return Some((root.with_hi(span.hi()), true));
+            } else {
+                return Some((*span, true));
+            }
+        } else {
+            if let Some(root) = &self.root_macro_call {
+                let snippet = clippy_utils::source::snippet(cx, *root, "..");
+                let span = find_insert_span(*root, place.to_macro_ident(), &snippet)?;
+                return Some((span, false));
+            }
         }
 
         None
@@ -210,6 +256,7 @@ impl<'tcx> LateLintPass<'tcx> for DefineMessages {
             return;
         };
 
+        // TODO: чуть прибраться в этом хламе
         for id in cx.tcx.hir().items() {
             if_chain! {
                 if matches!(cx.tcx.def_kind(id.owner_id), DefKind::Impl { .. });
@@ -234,10 +281,10 @@ impl<'tcx> LateLintPass<'tcx> for DefineMessages {
                                 for stmt in stmts.iter() {
                                     if_chain! {
                                         if let StmtKind::Semi(Expr {
-                                            kind: ExprKind::MethodCall(path, _, _, _),
+                                            kind: ExprKind::MethodCall(call_path, _, _, span),
                                             ..
                                         }) = stmt.kind;
-                                        if let Some(generic) = path.args().args.first();
+                                        if let Some(generic) = call_path.args().args.first();
                                         if let GenericArg::Type(Ty {
                                             kind: TyKind::Path(
                                                 QPath::Resolved(_, path)
@@ -246,7 +293,37 @@ impl<'tcx> LateLintPass<'tcx> for DefineMessages {
                                         }) = generic;
                                         if let Some(did) = path.res.opt_def_id();
                                         then {
+                                            if span.from_expansion() && self.root_macro_call.is_none() {
+                                                self.root_macro_call = clippy_utils::macros::root_macro_call(*span)
+                                                    .map(|c| c.span);
+                                            }
+
+                                            let name = call_path.ident.name;
                                             self.impls.remove(&did);
+
+                                            if name == sym!(add_provider) {
+                                                self.macro_places.insert(MacroPlace::Providers, path.span);
+                                            }
+
+                                            if name == sym!(add_message) {
+                                                self.macro_places.insert(MacroPlace::Messages, path.span);
+                                            }
+
+                                            if name == sym!(add_request) {
+                                                self.macro_places.insert(MacroPlace::Requests, path.span);
+                                            }
+
+                                            if name == sym!(add_task) {
+                                                self.macro_places.insert(MacroPlace::Tasks, path.span);
+                                            }
+
+                                            if name == sym!(add_notification) {
+                                                self.macro_places.insert(MacroPlace::EmitsNotifications, path.span);
+                                            }
+
+                                            if name == sym!(add_handle_notification) {
+                                                self.macro_places.insert(MacroPlace::Notifications, path.span);
+                                            }
                                         }
                                     }
                                 }
@@ -257,20 +334,63 @@ impl<'tcx> LateLintPass<'tcx> for DefineMessages {
             }
         }
 
-        for (_did, usage) in &self.impls {
-            let help = match usage {
-                MessageUsage::Notify(_, _) => "нотификация была источена, но не объявлена в `define_module!`",
+        for (did, usage) in &self.impls {
+            let (help, kind) = match usage {
+                MessageUsage::Notify(_, _) => (
+                    "нотификация была источена, но не объявлена в `define_module!`",
+                    MacroPlace::EmitsNotifications,
+                ),
 
-                MessageUsage::Handle(HandleKind::Provider(_, _)) => {
-                    "провайдер был имплементирован, но не указан в `define_module!`"
-                },
+                MessageUsage::Handle(HandleKind::Provider(_, _)) => (
+                    "провайдер был имплементирован, но не указан в `define_module!`",
+                    MacroPlace::Providers,
+                ),
 
-                MessageUsage::Handle(HandleKind::Handler(_, _)) => {
-                    "обработчик сообщения был имплементирован, но не указан в `define_module!`"
+                MessageUsage::Handle(HandleKind::Handler(_, _, kind)) => {
+                    let kind = match kind {
+                        Handler::Request => MacroPlace::Requests,
+                        Handler::Message => MacroPlace::Messages,
+                        Handler::Notification => MacroPlace::Notifications,
+                        Handler::Task => MacroPlace::Tasks,
+                    };
+
+                    (
+                        "обработчик сообщения был имплементирован, но не указан в `define_module!`",
+                        kind,
+                    )
                 },
             };
 
-            clippy_utils::diagnostics::span_lint(cx, DEFINE_MESSAGES, usage.span(), help);
+            let name = cx.tcx.def_path_str(did);
+
+            // FIXME: разобраться по-хорошему со спанами для автоматического фикса
+            // проверки на запятую отвратительные и не работают как надо
+            // ...
+            if let Some((span, with_comma)) = self.suggest_span(cx, kind) {
+                span_lint_and_then(cx, DEFINE_MESSAGES, usage.span(), help, |diag| {
+                    let source = cx.sess().source_map();
+                    let ident = clippy_utils::source::indent_of(cx, span.shrink_to_hi()).unwrap_or(0);
+                    let w = source.span_extend_to_next_char(span, ']', true);
+                    let contains_comma = clippy_utils::source::snippet(cx, w, "").contains(",");
+
+                    diag.span_help(span, "..добавьте сообщение в это определение..");
+                    diag.span_suggestion(
+                        span.shrink_to_hi(),
+                        "..в список",
+                        format!(
+                            "{}{name},",
+                            if !contains_comma {
+                                format!(",\n{}", " ".repeat(ident))
+                            } else {
+                                format!("\n{}", " ".repeat(ident))
+                            }
+                        ),
+                        Applicability::MachineApplicable,
+                    );
+                });
+            } else {
+                clippy_utils::diagnostics::span_lint(cx, DEFINE_MESSAGES, usage.span(), help);
+            }
         }
     }
 
@@ -312,4 +432,39 @@ impl<'tcx> LateLintPass<'tcx> for DefineMessages {
             }
         }
     }
+}
+
+fn find_insert_span(base: Span, kind: &str, text: &str) -> Option<Span> {
+    let mut offset = 0;
+
+    // отталкиваемся от первого найденного типа в макросе
+    // несколько циклов потому, что именна, в теории, могут
+    // пересекаться
+    loop {
+        if offset >= text.len() {
+            break;
+        }
+
+        let idx = text[offset..].find(kind)? + kind.len();
+        let mut iter = text
+            .chars()
+            .enumerate()
+            .skip(idx)
+            .skip_while(|(_, ch)| ch.is_ascii_whitespace());
+
+        let (new_idx, ch) = iter.next()?;
+        let (_, ch1) = iter.next()?;
+
+        if ch == '=' && ch1 == '>' {
+            let (idx, _) = iter.skip_while(|&(_, v)| v != '[').next()?;
+            let offset = offset + idx + 1;
+            let new = base.with_hi(rustc_span::BytePos(base.lo().0 + offset as u32));
+
+            return Some(new);
+        }
+
+        offset += new_idx;
+    }
+
+    None
 }
