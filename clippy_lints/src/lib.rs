@@ -1118,7 +1118,6 @@ pub fn register_plugins(store: &mut rustc_lint::LintStore, sess: &Session, conf:
     store.register_late_pass(|_| Box::new(implied_bounds_in_impls::ImpliedBoundsInImpls));
     store.register_late_pass(|_| Box::new(missing_asserts_for_indexing::MissingAssertsForIndexing));
     store.register_late_pass(|_| Box::new(unnecessary_map_on_constructor::UnnecessaryMapOnConstructor));
-<<<<<<< HEAD
     store.register_late_pass(move |_| {
         Box::new(needless_borrows_for_generic_args::NeedlessBorrowsForGenericArgs::new(
             msrv(),

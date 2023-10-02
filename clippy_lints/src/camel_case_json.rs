@@ -1,4 +1,3 @@
-// TODO: Config camelCase
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::get_trait_def_id;
 use clippy_utils::sugg::DiagnosticExt;
